@@ -42,6 +42,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 class LiveMonitorService : Service() {
     companion object {
         @Volatile
@@ -83,11 +84,23 @@ class LiveMonitorService : Service() {
     }
     private val networkExecutor = Executors.newSingleThreadExecutor()
     private val isCheckingNetwork = AtomicBoolean(false)
+    private val lastCheckElapsedMs = AtomicLong(0L)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var vibrator: Vibrator? = null
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
     private val currentlyRingingUids = mutableSetOf<String>()
+    private val internalLoopRunnable = object : Runnable {
+        override fun run() {
+            val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+            if (prefs.getBoolean("IS_MONITORING", false)) {
+                val interval = getPollIntervalSeconds()
+                scheduleNextHardwareAlarm(interval + 5)
+                triggerNetworkCheck(false)
+                mainHandler.postDelayed(this, interval * 1000L)
+            }
+        }
+    }
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onCreate() {
         super.onCreate()
@@ -104,6 +117,14 @@ class LiveMonitorService : Service() {
     private fun getPollIntervalSeconds(): Int {
         val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
         return prefs.getInt("POLL_INTERVAL_SECONDS", 20).coerceAtLeast(5)
+    }
+    private fun restartInternalLoop() {
+        mainHandler.removeCallbacks(internalLoopRunnable)
+        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("IS_MONITORING", false)) {
+            val interval = getPollIntervalSeconds()
+            mainHandler.postDelayed(internalLoopRunnable, interval * 1000L)
+        }
     }
     private fun wakeUpScreenForAlert() {
         try {
@@ -130,7 +151,8 @@ class LiveMonitorService : Service() {
             "ACTION_MUTE_ALARM" -> {
                 stopAlarmImmediately(this)
                 startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
-                scheduleNextHardwareAlarm(interval)
+                scheduleNextHardwareAlarm(interval + 5)
+                restartInternalLoop()
                 return START_STICKY
             }
             "ACTION_WATCH_LIVE" -> {
@@ -139,7 +161,8 @@ class LiveMonitorService : Service() {
                 stopAlarmImmediately(this)
                 openBiliLiveRoom(uid, roomId)
                 startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
-                scheduleNextHardwareAlarm(interval)
+                scheduleNextHardwareAlarm(interval + 5)
+                restartInternalLoop()
                 return START_STICKY
             }
             "ACTION_APPLY_ALERT_MODE" -> {
@@ -147,6 +170,13 @@ class LiveMonitorService : Service() {
                 if (prefs.getBoolean("IS_RINGING", false)) {
                     startSoundAndVibrationByMode()
                 }
+                return START_STICKY
+            }
+            "ACTION_UPDATE_INTERVAL" -> {
+                startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
+                scheduleNextHardwareAlarm(interval + 5)
+                restartInternalLoop()
+                triggerNetworkCheck(true)
                 return START_STICKY
             }
             "ACTION_TRIGGER_FROM_RECEIVER" -> {
@@ -157,7 +187,8 @@ class LiveMonitorService : Service() {
                 val roomId = intent.getStringExtra("ROOM_ID") ?: ""
                 if (uid.isNotEmpty()) currentlyRingingUids.add(uid)
                 startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
-                scheduleNextHardwareAlarm(interval)
+                scheduleNextHardwareAlarm(interval + 5)
+                restartInternalLoop()
                 triggerAlarmAndPopup(uname, title, face, uid, roomId)
                 return START_STICKY
             }
@@ -186,6 +217,7 @@ class LiveMonitorService : Service() {
                     stopAlarmImmediately(this)
                 }
                 if (arr.length() == 0 && !prefs.getBoolean("IS_MONITORING", false)) {
+                    mainHandler.removeCallbacks(internalLoopRunnable)
                     cancelHardwareAlarm()
                     stopSelf()
                 }
@@ -193,17 +225,24 @@ class LiveMonitorService : Service() {
             }
         }
         startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
-        scheduleNextHardwareAlarm(interval)
-        triggerNetworkCheck()
+        scheduleNextHardwareAlarm(interval + 5)
+        restartInternalLoop()
+        triggerNetworkCheck(intent?.action != "ACTION_POLL_NOW")
         return START_STICKY
     }
-    private fun triggerNetworkCheck() {
+    private fun triggerNetworkCheck(force: Boolean) {
+        val now = SystemClock.elapsedRealtime()
+        val minGapMs = (getPollIntervalSeconds() * 1000L - 1500L).coerceAtLeast(3000L)
+        if (!force && now - lastCheckElapsedMs.get() < minGapMs) {
+            return
+        }
         if (isCheckingNetwork.compareAndSet(false, true)) {
+            lastCheckElapsedMs.set(now)
             networkExecutor.execute {
                 val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
                 val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BiliLiveAlarm::CheckLock")
                 try {
-                    wl.acquire(12000L)
+                    wl.acquire(10000L)
                     checkAllStreamersStatus()
                 } finally {
                     try {
@@ -304,16 +343,18 @@ class LiveMonitorService : Service() {
             }
         }
         if (uidList.isEmpty()) return
-        queryBuilder.append("_t=").append(SystemClock.elapsedRealtime())
+        queryBuilder.append("_t=").append(System.currentTimeMillis())
         try {
             val url = URL(queryBuilder.toString())
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "GET"
             conn.useCaches = false
-            conn.connectTimeout = 5000
-            conn.readTimeout = 5000
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+            conn.connectTimeout = 6000
+            conn.readTimeout = 6000
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+            conn.setRequestProperty("Referer", "https://live.bilibili.com/")
             conn.setRequestProperty("Cache-Control", "no-cache")
+            conn.setRequestProperty("Connection", "close")
             if (conn.responseCode == 200) {
                 val text = BufferedReader(InputStreamReader(conn.inputStream)).readText()
                 val json = JSONObject(text)
@@ -727,6 +768,7 @@ class LiveMonitorService : Service() {
         super.onTaskRemoved(rootIntent)
     }
     override fun onDestroy() {
+        mainHandler.removeCallbacks(internalLoopRunnable)
         val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
         if (prefs.getBoolean("IS_MONITORING", false)) {
             scheduleNextHardwareAlarm(5)

@@ -350,6 +350,7 @@ class MainActivity : AppCompatActivity() {
         }
         loadSavedStreamers()
         updateRingingBannerUI()
+        refreshLiveStatusImmediately()
     }
     override fun onStop() {
         super.onStop()

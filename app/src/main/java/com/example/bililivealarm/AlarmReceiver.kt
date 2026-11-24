@@ -11,7 +11,6 @@ import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.os.Build
 import android.os.PowerManager
-import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import org.json.JSONArray
 import org.json.JSONObject
@@ -30,7 +29,7 @@ class AlarmReceiver : BroadcastReceiver() {
             wl.acquire(15000L)
         } catch (e: Exception) {}
         val interval = prefs.getInt("POLL_INTERVAL_SECONDS", 20).coerceAtLeast(5)
-        scheduleNextAlarm(context, interval)
+        scheduleNextAlarm(context, interval + 5)
         val serviceIntent = Intent(context, LiveMonitorService::class.java).apply {
             action = "ACTION_POLL_NOW"
         }
@@ -86,14 +85,16 @@ class AlarmReceiver : BroadcastReceiver() {
             val uid = arr.getJSONObject(i).optString("uid")
             if (uid.isNotEmpty()) queryBuilder.append("uids[]=").append(uid).append("&")
         }
-        queryBuilder.append("_t=").append(SystemClock.elapsedRealtime())
+        queryBuilder.append("_t=").append(System.currentTimeMillis())
         try {
             val conn = URL(queryBuilder.toString()).openConnection() as HttpURLConnection
             conn.requestMethod = "GET"
             conn.useCaches = false
-            conn.connectTimeout = 5000
-            conn.readTimeout = 5000
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+            conn.connectTimeout = 6000
+            conn.readTimeout = 6000
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+            conn.setRequestProperty("Referer", "https://live.bilibili.com/")
+            conn.setRequestProperty("Connection", "close")
             if (conn.responseCode == 200) {
                 val text = BufferedReader(InputStreamReader(conn.inputStream)).readText()
                 val json = JSONObject(text)
