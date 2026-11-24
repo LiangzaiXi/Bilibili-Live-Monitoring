@@ -95,7 +95,7 @@ class AlarmPopupActivity : AppCompatActivity() {
             }
         }
         val btnWatch = Button(this).apply {
-            text = "📺 去看直播"
+            text = "去看直播"
             textSize = 15f
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#FB7299"))

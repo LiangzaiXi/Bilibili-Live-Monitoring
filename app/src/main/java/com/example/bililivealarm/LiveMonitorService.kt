@@ -13,12 +13,9 @@ import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioTrack
 import android.media.MediaPlayer
 import android.media.RingtoneManager
 import android.net.Uri
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -88,23 +85,9 @@ class LiveMonitorService : Service() {
     private val isCheckingNetwork = AtomicBoolean(false)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var vibrator: Vibrator? = null
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
-    private var silentAudioTrack: AudioTrack? = null
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
     private val currentlyRingingUids = mutableSetOf<String>()
-    private val heartbeatRunnable = object : Runnable {
-        override fun run() {
-            val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-            if (prefs.getBoolean("IS_MONITORING", false)) {
-                acquireLocks()
-                scheduleNextHardwareAlarm(20)
-                triggerNetworkCheck()
-                mainHandler.postDelayed(this, 15000L)
-            }
-        }
-    }
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onCreate() {
         super.onCreate()
@@ -117,82 +100,10 @@ class LiveMonitorService : Service() {
             @Suppress("DEPRECATION")
             getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
-        acquireLocks()
-        startSilentAudioKeepAlive()
-        mainHandler.post(heartbeatRunnable)
     }
-    private fun acquireLocks() {
-        try {
-            if (wakeLock == null) {
-                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BiliLiveAlarm::CpuWakeLock").apply {
-                    setReferenceCounted(false)
-                }
-            }
-            if (wakeLock?.isHeld == false) {
-                wakeLock?.acquire()
-            }
-            if (wifiLock == null) {
-                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                val lockType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                } else {
-                    @Suppress("DEPRECATION")
-                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
-                }
-                wifiLock = wm.createWifiLock(lockType, "BiliLiveAlarm::WifiWakeLock").apply {
-                    setReferenceCounted(false)
-                }
-            }
-            if (wifiLock?.isHeld == false) {
-                wifiLock?.acquire()
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-    private fun startSilentAudioKeepAlive() {
-        if (silentAudioTrack != null) return
-        try {
-            val sampleRate = 8000
-            val minBufferSize = AudioTrack.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-            if (minBufferSize <= 0) return
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build()
-                )
-                .setBufferSizeInBytes(minBufferSize)
-                .setTransferMode(AudioTrack.MODE_STATIC)
-                .build()
-            val silentData = ByteArray(minBufferSize)
-            track.write(silentData, 0, silentData.size)
-            track.setLoopPoints(0, silentData.size / 2, -1)
-            track.play()
-            silentAudioTrack = track
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-    private fun stopSilentAudioKeepAlive() {
-        try {
-            silentAudioTrack?.stop()
-            silentAudioTrack?.release()
-        } catch (e: Exception) {}
-        silentAudioTrack = null
+    private fun getPollIntervalSeconds(): Int {
+        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+        return prefs.getInt("POLL_INTERVAL_SECONDS", 20).coerceAtLeast(5)
     }
     private fun wakeUpScreenForAlert() {
         try {
@@ -214,12 +125,10 @@ class LiveMonitorService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         instance = this
         createNotificationChannels()
-        acquireLocks()
-        startSilentAudioKeepAlive()
         when (intent?.action) {
             "ACTION_MUTE_ALARM" -> {
                 stopAlarmImmediately(this)
-                startForegroundCompat(buildSilentServiceNotification("靓仔监控运行中"))
+                startForegroundCompat(buildSilentServiceNotification("监控运行中"))
                 return START_STICKY
             }
             "ACTION_WATCH_LIVE" -> {
@@ -227,7 +136,7 @@ class LiveMonitorService : Service() {
                 val roomId = intent.getStringExtra("ROOM_ID") ?: ""
                 stopAlarmImmediately(this)
                 openBiliLiveRoom(uid, roomId)
-                startForegroundCompat(buildSilentServiceNotification("靓仔监控运行中"))
+                startForegroundCompat(buildSilentServiceNotification("监控运行中"))
                 return START_STICKY
             }
             "ACTION_APPLY_ALERT_MODE" -> {
@@ -237,14 +146,20 @@ class LiveMonitorService : Service() {
                 }
                 return START_STICKY
             }
+            "ACTION_UPDATE_INTERVAL" -> {
+                val interval = getPollIntervalSeconds()
+                startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
+                scheduleNextHardwareAlarm(interval)
+                return START_STICKY
+            }
             "ACTION_TEST_POPUP" -> {
-                startForegroundCompat(buildSilentServiceNotification("正在执行弹窗测试..."))
+                startForegroundCompat(buildSilentServiceNotification("正在执行弹窗测试"))
                 mainHandler.postDelayed({
                     val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
                     val arr = JSONArray(prefs.getString("STREAMER_LIST", "[]") ?: "[]")
                     val firstObj = if (arr.length() > 0) arr.getJSONObject(0) else null
                     val testName = firstObj?.optString("uname", "测试主播") ?: "测试主播"
-                    val testTitle = firstObj?.optString("title")?.takeIf { it.isNotEmpty() } ?: "锁屏亮屏与秒停测试成功！"
+                    val testTitle = firstObj?.optString("title")?.takeIf { it.isNotEmpty() } ?: "开播弹窗测试"
                     val testFace = firstObj?.optString("face", "") ?: ""
                     val testUid = firstObj?.optString("uid", "") ?: ""
                     val testRoomId = firstObj?.optString("room_id", "") ?: ""
@@ -262,22 +177,30 @@ class LiveMonitorService : Service() {
                     stopAlarmImmediately(this)
                 }
                 if (arr.length() == 0 && !prefs.getBoolean("IS_MONITORING", false)) {
+                    cancelHardwareAlarm()
                     stopSelf()
                 }
                 return START_STICKY
             }
         }
-        startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态..."))
-        mainHandler.removeCallbacks(heartbeatRunnable)
-        mainHandler.post(heartbeatRunnable)
+        val interval = getPollIntervalSeconds()
+        startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
+        scheduleNextHardwareAlarm(interval)
+        triggerNetworkCheck()
         return START_STICKY
     }
     private fun triggerNetworkCheck() {
         if (isCheckingNetwork.compareAndSet(false, true)) {
             networkExecutor.execute {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BiliLiveAlarm::CheckLock")
                 try {
+                    wl.acquire(12000L)
                     checkAllStreamersStatus()
                 } finally {
+                    try {
+                        if (wl.isHeld) wl.release()
+                    } catch (e: Exception) {}
                     isCheckingNetwork.set(false)
                 }
             }
@@ -313,8 +236,7 @@ class LiveMonitorService : Service() {
     private fun startForegroundCompat(notification: Notification) {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                startForeground(1, notification, types)
+                startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
             } else {
                 startForeground(1, notification)
             }
@@ -570,7 +492,7 @@ class LiveMonitorService : Service() {
                 cornerRadius = 10 * dp
             }
             val tvWatchBtn = TextView(themedCtx).apply {
-                text = "📺 去看直播"
+                text = "去看直播"
                 textSize = 15f
                 setTypeface(typeface, Typeface.BOLD)
                 setTextColor(Color.WHITE)
@@ -716,7 +638,7 @@ class LiveMonitorService : Service() {
             val manager = getSystemService(NotificationManager::class.java)
             val serviceChannel = NotificationChannel(
                 "BILI_SERVICE_SILENT_CH",
-                "后台常驻监控状态",
+                "后台监控状态",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 setSound(null, null)
@@ -724,7 +646,7 @@ class LiveMonitorService : Service() {
             }
             val alertChannel = NotificationChannel(
                 "BILI_ALARM_POPUP_HIGH_CH",
-                "主播开播强提醒通知",
+                "主播开播强提醒",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 enableVibration(true)
@@ -773,7 +695,7 @@ class LiveMonitorService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         return NotificationCompat.Builder(this, "BILI_ALARM_POPUP_HIGH_CH")
-            .setContentTitle("⏰ $uname 开播啦！")
+            .setContentTitle("$uname 开播啦！")
             .setContentText("直播间：$title")
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(watchPi)
@@ -789,32 +711,18 @@ class LiveMonitorService : Service() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
         if (prefs.getBoolean("IS_MONITORING", false)) {
-            scheduleNextHardwareAlarm(3)
-            val restartIntent = Intent(applicationContext, LiveMonitorService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                applicationContext.startForegroundService(restartIntent)
-            } else {
-                applicationContext.startService(restartIntent)
-            }
+            scheduleNextHardwareAlarm(5)
         }
         super.onTaskRemoved(rootIntent)
     }
     override fun onDestroy() {
-        mainHandler.removeCallbacks(heartbeatRunnable)
-        stopSilentAudioKeepAlive()
         val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
         if (prefs.getBoolean("IS_MONITORING", false)) {
-            scheduleNextHardwareAlarm(3)
+            scheduleNextHardwareAlarm(5)
         } else {
             cancelHardwareAlarm()
         }
         stopAlarmImmediately(this)
-        try {
-            if (wakeLock?.isHeld == true) wakeLock?.release()
-        } catch (e: Exception) {}
-        try {
-            if (wifiLock?.isHeld == true) wifiLock?.release()
-        } catch (e: Exception) {}
         if (instance === this) instance = null
         super.onDestroy()
     }

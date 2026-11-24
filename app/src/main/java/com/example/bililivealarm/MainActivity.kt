@@ -2,6 +2,7 @@ package com.example.bililivealarm
 import android.Manifest
 import android.app.AlarmManager
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -57,6 +58,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvBannerTitle: TextView
     private lateinit var tvBannerSub: TextView
     private lateinit var tvStatus: TextView
+    private lateinit var etInterval: EditText
     private var isInternalTextChange = false
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -74,6 +76,8 @@ class MainActivity : AppCompatActivity() {
         val rbSoundAndVibrate = findViewById<RadioButton>(R.id.rbSoundAndVibrate)
         val rbVibrateOnly = findViewById<RadioButton>(R.id.rbVibrateOnly)
         val rbSoundOnly = findViewById<RadioButton>(R.id.rbSoundOnly)
+        etInterval = findViewById(R.id.etInterval)
+        val btnSaveInterval = findViewById<Button>(R.id.btnSaveInterval)
         val btnStartMonitor = findViewById<Button>(R.id.btnStartMonitor)
         val btnRefreshStatus = findViewById<Button>(R.id.btnRefreshStatus)
         val btnStopMonitor = findViewById<Button>(R.id.btnStopMonitor)
@@ -85,6 +89,23 @@ class MainActivity : AppCompatActivity() {
         tvBannerSub = findViewById(R.id.tvBannerSub)
         val btnBannerDismiss = findViewById<Button>(R.id.btnBannerDismiss)
         val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+        val savedInterval = prefs.getInt("POLL_INTERVAL_SECONDS", 20).coerceAtLeast(5)
+        etInterval.setText(savedInterval.toString())
+        btnSaveInterval.setOnClickListener {
+            hideKeyboard(etInterval)
+            val seconds = saveIntervalSetting(true)
+            if (prefs.getBoolean("IS_MONITORING", false)) {
+                val updateIntent = Intent(this, LiveMonitorService::class.java).apply {
+                    action = "ACTION_UPDATE_INTERVAL"
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(updateIntent)
+                } else {
+                    startService(updateIntent)
+                }
+                tvStatus.text = "当前状态：监控运行中，每${seconds}秒检测"
+            }
+        }
         btnBannerDismiss.setOnClickListener {
             muteCurrentAlarm()
         }
@@ -96,7 +117,7 @@ class MainActivity : AppCompatActivity() {
         }
         btnTestPopup.setOnClickListener {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-                Toast.makeText(this, "请先授予悬浮窗权限，否则切到其他App时会被系统拦截弹窗", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "请先授予悬浮窗权限", Toast.LENGTH_LONG).show()
                 try {
                     startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                 } catch (e: Exception) {
@@ -104,7 +125,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 return@setOnClickListener
             }
-            Toast.makeText(this, "3秒后将触发弹窗，现在可以切到桌面或其他App测试！", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "3秒后将触发弹窗，可切到桌面测试", Toast.LENGTH_LONG).show()
             val testIntent = Intent(this, LiveMonitorService::class.java).apply {
                 action = "ACTION_TEST_POPUP"
             }
@@ -180,14 +201,14 @@ class MainActivity : AppCompatActivity() {
         updateRingingBannerUI()
         refreshLiveStatusImmediately()
         if (prefs.getBoolean("IS_MONITORING", false)) {
-            tvStatus.text = "当前状态：监控运行中"
+            tvStatus.text = "当前状态：监控运行中，每${savedInterval}秒检测"
         }
         lvStreamers.setOnItemClickListener { _, _, position, _ ->
             val target = streamerDataList[position]
             val uname = target.optString("uname")
             val uid = target.optString("uid")
             val roomId = target.optString("room_id")
-            val options = arrayOf("去B站看直播 / 个人空间", "从监控列表中移除 $uname")
+            val options = arrayOf("去看直播", "移除主播")
             AlertDialog.Builder(this)
                 .setTitle(uname)
                 .setItems(options) { _, which ->
@@ -201,20 +222,22 @@ class MainActivity : AppCompatActivity() {
         }
         btnStartMonitor.setOnClickListener {
             if (streamerDataList.isEmpty()) {
-                Toast.makeText(this, "请先在上方搜索框输入并点选添加主播", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "请先搜索并添加主播", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
+            hideKeyboard(etInterval)
+            val seconds = saveIntervalSetting(false)
             prefs.edit()
                 .putBoolean("IS_MONITORING", true)
                 .putStringSet("NOTIFIED_UIDS", emptySet())
                 .apply()
             refreshLiveStatusImmediately()
-            tvStatus.text = "当前状态：监控运行中"
-            Toast.makeText(this, "已启动监控", Toast.LENGTH_SHORT).show()
+            tvStatus.text = "当前状态：监控运行中，每${seconds}秒检测"
+            Toast.makeText(this, "已开始监控，每${seconds}秒检测一次", Toast.LENGTH_SHORT).show()
         }
         btnRefreshStatus.setOnClickListener {
             prefs.edit().putStringSet("NOTIFIED_UIDS", emptySet()).apply()
-            Toast.makeText(this, "已重置提醒状态，正在重新检测在播主播...", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "正在刷新开播状态", Toast.LENGTH_SHORT).show()
             refreshLiveStatusImmediately()
         }
         btnStopMonitor.setOnClickListener {
@@ -226,6 +249,26 @@ class MainActivity : AppCompatActivity() {
             updateRingingBannerUI()
             tvStatus.text = "当前状态：已停止监控"
         }
+    }
+    private fun saveIntervalSetting(showToast: Boolean): Int {
+        val raw = etInterval.text.toString().trim().toIntOrNull()
+        val seconds = if (raw == null || raw < 5) {
+            etInterval.setText("5")
+            if (showToast) {
+                Toast.makeText(this, "检测间隔不能小于5秒，已设为5秒", Toast.LENGTH_SHORT).show()
+            }
+            5
+        } else {
+            if (showToast) {
+                Toast.makeText(this, "已保存检测间隔：${raw}秒", Toast.LENGTH_SHORT).show()
+            }
+            raw
+        }
+        getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+            .edit()
+            .putInt("POLL_INTERVAL_SECONDS", seconds)
+            .apply()
+        return seconds
     }
     private fun muteCurrentAlarm() {
         LiveMonitorService.stopAlarmImmediately(this)
@@ -245,7 +288,7 @@ class MainActivity : AppCompatActivity() {
                 .putBoolean("IS_RINGING", false)
                 .apply()
             stopService(Intent(this, LiveMonitorService::class.java))
-            tvStatus.text = "当前状态：列表已空，自动停止监控"
+            tvStatus.text = "当前状态：已停止监控"
         } else {
             val removeIntent = Intent(this, LiveMonitorService::class.java).apply {
                 action = "ACTION_REMOVE_UID"
@@ -284,8 +327,8 @@ class MainActivity : AppCompatActivity() {
             val uname = prefs.getString("RINGING_UNAME", "主播") ?: "主播"
             val title = prefs.getString("RINGING_TITLE", "正在直播") ?: "正在直播"
             val face = prefs.getString("RINGING_FACE", "") ?: ""
-            tvBannerTitle.text = "🔔 $uname 开播啦！"
-            tvBannerSub.text = "点击此处看直播 · $title"
+            tvBannerTitle.text = "$uname 开播啦！"
+            tvBannerSub.text = "点击去看直播 · $title"
             AvatarLoader.load(face, ivBannerAvatar)
             llRingingBanner.visibility = View.VISIBLE
         } else {
@@ -445,8 +488,8 @@ class MainActivity : AppCompatActivity() {
     }
     private fun formatFansCount(fans: Int): String {
         if (fans < 0) return "UID精准匹配"
-        if (fans >= 10000) return String.format("粉丝: %.1f万", fans / 10000f)
-        return "粉丝: $fans"
+        if (fans >= 10000) return String.format("粉丝 %.1f万", fans / 10000f)
+        return "粉丝 $fans"
     }
     inner class DropdownSearchAdapter : BaseAdapter() {
         override fun getCount(): Int = dropdownCandidates.size
@@ -486,7 +529,7 @@ class MainActivity : AppCompatActivity() {
             val tvName = row.findViewById<TextView>(1002)
             val tvSub = row.findViewById<TextView>(1003)
             tvName.text = item.optString("uname")
-            tvSub.text = "${formatFansCount(item.optInt("fans", 0))}  ·  UID: ${item.optString("uid")}"
+            tvSub.text = "${formatFansCount(item.optInt("fans", 0))} · UID ${item.optString("uid")}"
             AvatarLoader.load(item.optString("face"), ivAvatar)
             return row
         }
@@ -529,10 +572,9 @@ class MainActivity : AppCompatActivity() {
             val tvName = row.findViewById<TextView>(2002)
             val tvLive = row.findViewById<TextView>(2003)
             val uname = item.optString("uname")
-            val uid = item.optString("uid")
             val liveStatus = item.optInt("live_status", 0)
             val title = item.optString("title", "")
-            tvName.text = "$uname  (UID: $uid)"
+            tvName.text = uname
             if (liveStatus == 1) {
                 tvLive.text = if (title.isNotEmpty()) "🔴 直播中：$title" else "🔴 直播中"
                 tvLive.setTextColor(Color.parseColor("#00A854"))
@@ -576,31 +618,70 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            if (!Settings.canDrawOverlays(this)) {
-                AlertDialog.Builder(this)
-                    .setTitle("需要悬浮窗权限")
-                    .setMessage("开启后才能在看其他App或桌面时直接弹出带主播头像的开播提醒窗口。")
-                    .setPositiveButton("去开启") { _, _ ->
-                        try {
-                            val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
-                            startActivity(intent)
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            AlertDialog.Builder(this)
+                .setTitle("需要悬浮窗权限")
+                .setMessage("开启后可在看其他应用时直接弹出主播开播提醒窗口。")
+                .setPositiveButton("去开启") { _, _ ->
+                    try {
+                        val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                        startActivity(intent)
+                    } catch (e: Exception) {
+                        e.printStackTrace()
                     }
-                    .setNegativeButton("暂不", null)
-                    .show()
-            }
+                    promptAutoStartPermissionIfNeeded()
+                }
+                .setNegativeButton("暂不") { _, _ ->
+                    promptAutoStartPermissionIfNeeded()
+                }
+                .show()
+        } else {
+            promptAutoStartPermissionIfNeeded()
         }
     }
-    @Deprecated("Deprecated in Java")
-    override fun onBackPressed() {
+    private fun promptAutoStartPermissionIfNeeded() {
         val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-        if (prefs.getBoolean("IS_MONITORING", false)) {
-            finishAndRemoveTask()
-        } else {
-            super.onBackPressed()
+        if (prefs.getBoolean("HAS_PROMPTED_AUTOSTART", false)) return
+        AlertDialog.Builder(this)
+            .setTitle("开启自启动权限")
+            .setMessage("为了防止后台被系统清理后无法提醒，请前往系统设置开启靓仔监控的自启动开关。")
+            .setPositiveButton("去开启") { _, _ ->
+                prefs.edit().putBoolean("HAS_PROMPTED_AUTOSTART", true).apply()
+                openAutoStartSettings()
+            }
+            .setNegativeButton("已开启") { _, _ ->
+                prefs.edit().putBoolean("HAS_PROMPTED_AUTOSTART", true).apply()
+            }
+            .show()
+    }
+    private fun openAutoStartSettings() {
+        val intents = listOf(
+            Intent().setComponent(ComponentName("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity")),
+            Intent().setComponent(ComponentName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity")),
+            Intent().setComponent(ComponentName("com.hihonor.systemmanager", "com.hihonor.systemmanager.startupmgr.ui.StartupNormalAppListActivity")),
+            Intent().setComponent(ComponentName("com.oplus.safecenter", "com.oplus.safecenter.permission.startup.StartupAppListActivity")),
+            Intent().setComponent(ComponentName("com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupAppListActivity")),
+            Intent().setComponent(ComponentName("com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.BgStartUpManager")),
+            Intent().setComponent(ComponentName("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"))
+        )
+        for (intent in intents) {
+            try {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY) != null) {
+                    startActivity(intent)
+                    return
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+        try {
+            val detailIntent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(detailIntent)
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 }

@@ -25,7 +25,7 @@
             android:id="@+id/btnTestPopup"
             android:layout_width="wrap_content"
             android:layout_height="38dp"
-            android:text="测试3秒后弹窗"
+            android:text="测试弹窗"
             android:textSize="12sp" />
     </LinearLayout>
     <LinearLayout
@@ -61,7 +61,7 @@
                 android:id="@+id/tvBannerSub"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="点击右侧按钮停止提醒"
+                android:text="去看直播"
                 android:textColor="#555555"
                 android:textSize="12sp" />
         </LinearLayout>
@@ -121,6 +121,43 @@
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="检测间隔："
+            android:textColor="#333333"
+            android:textSize="14sp" />
+        <EditText
+            android:id="@+id/etInterval"
+            android:layout_width="68dp"
+            android:layout_height="40dp"
+            android:gravity="center"
+            android:inputType="number"
+            android:maxLength="4"
+            android:singleLine="true"
+            android:text="20"
+            android:textSize="14sp" />
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:text="秒"
+            android:textColor="#333333"
+            android:textSize="14sp" />
+        <Button
+            android:id="@+id/btnSaveInterval"
+            android:layout_width="wrap_content"
+            android:layout_height="38dp"
+            android:layout_marginStart="12dp"
+            android:text="保存间隔"
+            android:textSize="12sp" />
+    </LinearLayout>
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
         android:layout_marginTop="6dp"
         android:orientation="horizontal">
         <Button
@@ -128,14 +165,14 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="启动监控" />
+            android:text="开始监控" />
         <Button
             android:id="@+id/btnRefreshStatus"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_marginStart="8dp"
             android:layout_weight="1"
-            android:text="刷新并重检" />
+            android:text="刷新状态" />
         <Button
             android:id="@+id/btnStopMonitor"
             android:layout_width="0dp"
