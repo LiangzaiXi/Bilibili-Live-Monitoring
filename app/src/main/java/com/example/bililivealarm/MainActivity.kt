@@ -279,7 +279,7 @@ class MainActivity : AppCompatActivity() {
         streamerDataList.removeAt(position)
         val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
         val notifiedSet = (prefs.getStringSet("NOTIFIED_UIDS", emptySet()) ?: emptySet()).toMutableSet()
-        notifiedSet.remove(uid)
+        notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
         prefs.edit().putStringSet("NOTIFIED_UIDS", notifiedSet).apply()
         saveStreamers()
         if (streamerDataList.isEmpty()) {
@@ -451,7 +451,7 @@ class MainActivity : AppCompatActivity() {
         }
         val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
         val notifiedSet = (prefs.getStringSet("NOTIFIED_UIDS", emptySet()) ?: emptySet()).toMutableSet()
-        notifiedSet.remove(uid)
+        notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
         prefs.edit().putStringSet("NOTIFIED_UIDS", notifiedSet).apply()
         val obj = JSONObject().apply {
             put("uid", uid)

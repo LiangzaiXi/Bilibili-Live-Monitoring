@@ -125,10 +125,12 @@ class LiveMonitorService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         instance = this
         createNotificationChannels()
+        val interval = getPollIntervalSeconds()
         when (intent?.action) {
             "ACTION_MUTE_ALARM" -> {
                 stopAlarmImmediately(this)
-                startForegroundCompat(buildSilentServiceNotification("监控运行中"))
+                startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
+                scheduleNextHardwareAlarm(interval)
                 return START_STICKY
             }
             "ACTION_WATCH_LIVE" -> {
@@ -136,7 +138,8 @@ class LiveMonitorService : Service() {
                 val roomId = intent.getStringExtra("ROOM_ID") ?: ""
                 stopAlarmImmediately(this)
                 openBiliLiveRoom(uid, roomId)
-                startForegroundCompat(buildSilentServiceNotification("监控运行中"))
+                startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
+                scheduleNextHardwareAlarm(interval)
                 return START_STICKY
             }
             "ACTION_APPLY_ALERT_MODE" -> {
@@ -146,10 +149,16 @@ class LiveMonitorService : Service() {
                 }
                 return START_STICKY
             }
-            "ACTION_UPDATE_INTERVAL" -> {
-                val interval = getPollIntervalSeconds()
+            "ACTION_TRIGGER_FROM_RECEIVER" -> {
+                val uname = intent.getStringExtra("UNAME") ?: "关注的主播"
+                val title = intent.getStringExtra("TITLE") ?: "正在直播中"
+                val face = intent.getStringExtra("FACE") ?: ""
+                val uid = intent.getStringExtra("UID") ?: ""
+                val roomId = intent.getStringExtra("ROOM_ID") ?: ""
+                if (uid.isNotEmpty()) currentlyRingingUids.add(uid)
                 startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
                 scheduleNextHardwareAlarm(interval)
+                triggerAlarmAndPopup(uname, title, face, uid, roomId)
                 return START_STICKY
             }
             "ACTION_TEST_POPUP" -> {
@@ -183,7 +192,6 @@ class LiveMonitorService : Service() {
                 return START_STICKY
             }
         }
-        val interval = getPollIntervalSeconds()
         startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
         scheduleNextHardwareAlarm(interval)
         triggerNetworkCheck()
@@ -325,6 +333,8 @@ class LiveMonitorService : Service() {
                         val info = dataObj?.optJSONObject(uid)
                         if (info != null) {
                             val liveStatus = info.optInt("live_status", 0)
+                            val liveTime = info.optString("live_time", "0").trim()
+                            val sessionKey = "${uid}_${liveTime}"
                             val uname = info.optString("uname", item.optString("uname"))
                             val title = info.optString("title", "")
                             val face = info.optString("face", item.optString("face"))
@@ -337,8 +347,9 @@ class LiveMonitorService : Service() {
                                 item.put("face", face)
                             }
                             if (liveStatus == 1) {
-                                if (isMonitoring && !notifiedSet.contains(uid)) {
-                                    notifiedSet.add(uid)
+                                if (isMonitoring && !notifiedSet.contains(sessionKey)) {
+                                    notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
+                                    notifiedSet.add(sessionKey)
                                     newlyLiveNames.add(uname)
                                     newlyLiveUids.add(uid)
                                     if (firstNewlyLive == null) {
@@ -346,12 +357,12 @@ class LiveMonitorService : Service() {
                                     }
                                 }
                             } else {
-                                notifiedSet.remove(uid)
+                                notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
                                 currentlyRingingUids.remove(uid)
                             }
                         } else {
                             item.put("live_status", 0)
-                            notifiedSet.remove(uid)
+                            notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
                             currentlyRingingUids.remove(uid)
                         }
                     }

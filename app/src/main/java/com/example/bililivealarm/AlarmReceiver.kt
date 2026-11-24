@@ -107,6 +107,8 @@ class AlarmReceiver : BroadcastReceiver() {
                         val uid = item.optString("uid")
                         val info = dataObj?.optJSONObject(uid)
                         val liveStatus = info?.optInt("live_status", 0) ?: 0
+                        val liveTime = info?.optString("live_time", "0")?.trim() ?: "0"
+                        val sessionKey = "${uid}_${liveTime}"
                         item.put("live_status", liveStatus)
                         if (info != null) {
                             item.put("uname", info.optString("uname", item.optString("uname")))
@@ -116,13 +118,14 @@ class AlarmReceiver : BroadcastReceiver() {
                             if (face.isNotEmpty()) item.put("face", face)
                         }
                         if (liveStatus == 1) {
-                            if (!notifiedSet.contains(uid)) {
-                                notifiedSet.add(uid)
+                            if (!notifiedSet.contains(sessionKey)) {
+                                notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
+                                notifiedSet.add(sessionKey)
                                 newlyLiveNames.add(item.optString("uname"))
                                 if (firstLive == null) firstLive = item
                             }
                         } else {
-                            notifiedSet.remove(uid)
+                            notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
                         }
                     }
                     prefs.edit()
@@ -130,14 +133,28 @@ class AlarmReceiver : BroadcastReceiver() {
                         .putStringSet("NOTIFIED_UIDS", notifiedSet)
                         .commit()
                     if (firstLive != null) {
-                        sendFallbackAlarmNotification(
-                            context,
-                            newlyLiveNames.joinToString("、"),
-                            firstLive.optString("title", "正在直播中"),
-                            firstLive.optString("uid", ""),
-                            firstLive.optString("room_id", ""),
-                            firstLive.optString("face", "")
-                        )
+                        val allNames = newlyLiveNames.joinToString("、")
+                        val title = firstLive.optString("title", "正在直播中")
+                        val uid = firstLive.optString("uid", "")
+                        val roomId = firstLive.optString("room_id", "")
+                        val face = firstLive.optString("face", "")
+                        try {
+                            val triggerIntent = Intent(context, LiveMonitorService::class.java).apply {
+                                action = "ACTION_TRIGGER_FROM_RECEIVER"
+                                putExtra("UNAME", allNames)
+                                putExtra("TITLE", title)
+                                putExtra("FACE", face)
+                                putExtra("UID", uid)
+                                putExtra("ROOM_ID", roomId)
+                            }
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                context.startForegroundService(triggerIntent)
+                            } else {
+                                context.startService(triggerIntent)
+                            }
+                        } catch (ex: Exception) {
+                            sendFallbackAlarmNotification(context, allNames, title, uid, roomId, face)
+                        }
                     }
                 }
             }
