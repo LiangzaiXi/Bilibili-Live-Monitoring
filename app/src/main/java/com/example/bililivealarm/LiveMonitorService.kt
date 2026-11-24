@@ -1,5 +1,4 @@
 package com.example.bililivealarm
-import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -21,7 +20,6 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
-import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -34,20 +32,26 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.net.HttpURLConnection
-import java.net.URL
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 class LiveMonitorService : Service() {
     companion object {
         @Volatile
         private var instance: LiveMonitorService? = null
         private val activePlayers = mutableListOf<MediaPlayer>()
+        @Synchronized
+        fun nextAlertNotifId(context: Context): Int {
+            val prefs = context.getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+            val oldId = prefs.getInt("LAST_ALERT_NOTIF_ID", 2002)
+            val newId = if (oldId in 2002..2998) oldId + 1 else 2002
+            prefs.edit().putInt("LAST_ALERT_NOTIF_ID", newId).commit()
+            try {
+                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.cancel(oldId)
+            } catch (e: Exception) {}
+            return newId
+        }
+        fun applyAlertModeIfRinging() {
+            instance?.startSoundAndVibrationByMode()
+        }
         @Synchronized
         fun stopAlarmImmediately(context: Context) {
             for (player in activePlayers) {
@@ -69,38 +73,22 @@ class LiveMonitorService : Service() {
                 vib.cancel()
             } catch (e: Exception) {}
             val prefs = context.getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+            val lastAlertId = prefs.getInt("LAST_ALERT_NOTIF_ID", 2002)
             prefs.edit().putBoolean("IS_RINGING", false).commit()
             try {
                 val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.cancel(lastAlertId)
                 nm.cancel(2002)
             } catch (e: Exception) {}
-            instance?.let { svc ->
-                svc.currentlyRingingUids.clear()
-                svc.removeSystemOverlayPopup()
-            }
+            instance?.stopServiceCleanly()
             context.sendBroadcast(Intent("com.example.bililivealarm.ACTION_ALARM_STOPPED").setPackage(context.packageName))
             context.sendBroadcast(Intent("com.example.bililivealarm.ACTION_STATUS_UPDATED").setPackage(context.packageName))
         }
     }
-    private val networkExecutor = Executors.newSingleThreadExecutor()
-    private val isCheckingNetwork = AtomicBoolean(false)
-    private val lastCheckElapsedMs = AtomicLong(0L)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var vibrator: Vibrator? = null
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
-    private val currentlyRingingUids = mutableSetOf<String>()
-    private val internalLoopRunnable = object : Runnable {
-        override fun run() {
-            val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-            if (prefs.getBoolean("IS_MONITORING", false)) {
-                val interval = getPollIntervalSeconds()
-                scheduleNextHardwareAlarm(interval + 5)
-                triggerNetworkCheck(false)
-                mainHandler.postDelayed(this, interval * 1000L)
-            }
-        }
-    }
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onCreate() {
         super.onCreate()
@@ -114,16 +102,39 @@ class LiveMonitorService : Service() {
             getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
     }
-    private fun getPollIntervalSeconds(): Int {
-        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-        return prefs.getInt("POLL_INTERVAL_SECONDS", 20).coerceAtLeast(5)
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        instance = this
+        createNotificationChannels()
+        when (intent?.action) {
+            "ACTION_MUTE_ALARM" -> {
+                stopAlarmImmediately(this)
+                return START_NOT_STICKY
+            }
+            "ACTION_START_ALARM" -> {
+                val uname = intent.getStringExtra("UNAME") ?: "关注的主播"
+                val title = intent.getStringExtra("TITLE") ?: "正在直播中"
+                val face = intent.getStringExtra("FACE") ?: ""
+                val uid = intent.getStringExtra("UID") ?: ""
+                val roomId = intent.getStringExtra("ROOM_ID") ?: ""
+                triggerAlarmAndPopup(uname, title, face, uid, roomId)
+                return START_NOT_STICKY
+            }
+        }
+        stopServiceCleanly()
+        return START_NOT_STICKY
     }
-    private fun restartInternalLoop() {
-        mainHandler.removeCallbacks(internalLoopRunnable)
-        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-        if (prefs.getBoolean("IS_MONITORING", false)) {
-            val interval = getPollIntervalSeconds()
-            mainHandler.postDelayed(internalLoopRunnable, interval * 1000L)
+    private fun stopServiceCleanly() {
+        removeSystemOverlayPopup()
+        mainHandler.post {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
+            } catch (e: Exception) {}
+            stopSelf()
         }
     }
     private fun wakeUpScreenForAlert() {
@@ -143,114 +154,50 @@ class LiveMonitorService : Service() {
             e.printStackTrace()
         }
     }
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        instance = this
-        createNotificationChannels()
-        val interval = getPollIntervalSeconds()
-        when (intent?.action) {
-            "ACTION_MUTE_ALARM" -> {
-                stopAlarmImmediately(this)
-                startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
-                scheduleNextHardwareAlarm(interval + 5)
-                restartInternalLoop()
-                return START_STICKY
-            }
-            "ACTION_WATCH_LIVE" -> {
-                val uid = intent.getStringExtra("UID") ?: ""
-                val roomId = intent.getStringExtra("ROOM_ID") ?: ""
-                stopAlarmImmediately(this)
-                openBiliLiveRoom(uid, roomId)
-                startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
-                scheduleNextHardwareAlarm(interval + 5)
-                restartInternalLoop()
-                return START_STICKY
-            }
-            "ACTION_APPLY_ALERT_MODE" -> {
-                val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-                if (prefs.getBoolean("IS_RINGING", false)) {
-                    startSoundAndVibrationByMode()
-                }
-                return START_STICKY
-            }
-            "ACTION_UPDATE_INTERVAL" -> {
-                startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
-                scheduleNextHardwareAlarm(interval + 5)
-                restartInternalLoop()
-                triggerNetworkCheck(true)
-                return START_STICKY
-            }
-            "ACTION_TRIGGER_FROM_RECEIVER" -> {
-                val uname = intent.getStringExtra("UNAME") ?: "关注的主播"
-                val title = intent.getStringExtra("TITLE") ?: "正在直播中"
-                val face = intent.getStringExtra("FACE") ?: ""
-                val uid = intent.getStringExtra("UID") ?: ""
-                val roomId = intent.getStringExtra("ROOM_ID") ?: ""
-                if (uid.isNotEmpty()) currentlyRingingUids.add(uid)
-                startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
-                scheduleNextHardwareAlarm(interval + 5)
-                restartInternalLoop()
-                triggerAlarmAndPopup(uname, title, face, uid, roomId)
-                return START_STICKY
-            }
-            "ACTION_TEST_POPUP" -> {
-                startForegroundCompat(buildSilentServiceNotification("正在执行弹窗测试"))
-                mainHandler.postDelayed({
-                    val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-                    val arr = JSONArray(prefs.getString("STREAMER_LIST", "[]") ?: "[]")
-                    val firstObj = if (arr.length() > 0) arr.getJSONObject(0) else null
-                    val testName = firstObj?.optString("uname", "测试主播") ?: "测试主播"
-                    val testTitle = firstObj?.optString("title")?.takeIf { it.isNotEmpty() } ?: "开播弹窗测试"
-                    val testFace = firstObj?.optString("face", "") ?: ""
-                    val testUid = firstObj?.optString("uid", "") ?: ""
-                    val testRoomId = firstObj?.optString("room_id", "") ?: ""
-                    currentlyRingingUids.add("TEST_UID")
-                    triggerAlarmAndPopup(testName, testTitle, testFace, testUid, testRoomId)
-                }, 3000)
-                return START_STICKY
-            }
-            "ACTION_REMOVE_UID" -> {
-                val removedUid = intent.getStringExtra("UID") ?: ""
-                currentlyRingingUids.remove(removedUid)
-                val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-                val arr = JSONArray(prefs.getString("STREAMER_LIST", "[]") ?: "[]")
-                if (currentlyRingingUids.isEmpty() || arr.length() == 0) {
-                    stopAlarmImmediately(this)
-                }
-                if (arr.length() == 0 && !prefs.getBoolean("IS_MONITORING", false)) {
-                    mainHandler.removeCallbacks(internalLoopRunnable)
-                    cancelHardwareAlarm()
-                    stopSelf()
-                }
-                return START_STICKY
-            }
+    private fun triggerAlarmAndPopup(uname: String, title: String, face: String, uid: String, roomId: String) {
+        wakeUpScreenForAlert()
+        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putBoolean("IS_RINGING", true)
+            .putString("RINGING_UNAME", uname)
+            .putString("RINGING_TITLE", title)
+            .putString("RINGING_FACE", face)
+            .putString("RINGING_UID", uid)
+            .putString("RINGING_ROOM_ID", roomId)
+            .commit()
+        val popupIntent = Intent(this, AlarmPopupActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("UNAME", uname)
+            putExtra("TITLE", title)
+            putExtra("FACE", face)
+            putExtra("UID", uid)
+            putExtra("ROOM_ID", roomId)
         }
-        startForegroundCompat(buildSilentServiceNotification("正在监控主播开播状态，每${interval}秒检测"))
-        scheduleNextHardwareAlarm(interval + 5)
-        restartInternalLoop()
-        triggerNetworkCheck(intent?.action != "ACTION_POLL_NOW")
-        return START_STICKY
-    }
-    private fun triggerNetworkCheck(force: Boolean) {
-        val now = SystemClock.elapsedRealtime()
-        val minGapMs = (getPollIntervalSeconds() * 1000L - 1500L).coerceAtLeast(3000L)
-        if (!force && now - lastCheckElapsedMs.get() < minGapMs) {
-            return
-        }
-        if (isCheckingNetwork.compareAndSet(false, true)) {
-            lastCheckElapsedMs.set(now)
-            networkExecutor.execute {
-                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-                val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BiliLiveAlarm::CheckLock")
+        val notifId = nextAlertNotifId(this)
+        val alertNotification = buildHighPriorityAlertNotification(uname, title, uid, roomId, popupIntent)
+        startForegroundCompat(notifId, alertNotification)
+        sendBroadcast(Intent("com.example.bililivealarm.ACTION_STATUS_UPDATED").setPackage(packageName))
+        mainHandler.post {
+            val overlayShown = showSystemOverlayPopup(uname, title, face, uid, roomId)
+            if (!overlayShown) {
                 try {
-                    wl.acquire(10000L)
-                    checkAllStreamersStatus()
-                } finally {
-                    try {
-                        if (wl.isHeld) wl.release()
-                    } catch (e: Exception) {}
-                    isCheckingNetwork.set(false)
+                    startActivity(popupIntent)
+                } catch (e: Exception) {
+                    e.printStackTrace()
                 }
             }
+        }
+        startSoundAndVibrationByMode()
+    }
+    private fun startForegroundCompat(id: Int, notification: Notification) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(id, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            } else {
+                startForeground(id, notification)
+            }
+        } catch (e: Exception) {
+            startForeground(id, notification)
         }
     }
     private fun openBiliLiveRoom(uid: String, roomId: String) {
@@ -279,197 +226,6 @@ class LiveMonitorService : Service() {
                 ex.printStackTrace()
             }
         }
-    }
-    private fun startForegroundCompat(notification: Notification) {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-            } else {
-                startForeground(1, notification)
-            }
-        } catch (e: Exception) {
-            startForeground(1, notification)
-        }
-    }
-    private fun scheduleNextHardwareAlarm(delaySeconds: Int) {
-        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-        if (!prefs.getBoolean("IS_MONITORING", false)) return
-        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val intent = Intent(this, AlarmReceiver::class.java).apply {
-            action = "com.example.bililivealarm.ACTION_ALARM_POLL"
-        }
-        val pi = PendingIntent.getBroadcast(
-            this, 1001, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val triggerTime = System.currentTimeMillis() + delaySeconds * 1000L
-        try {
-            val showIntent = Intent(this, MainActivity::class.java)
-            val showPi = PendingIntent.getActivity(
-                this, 1002, showIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            val clockInfo = AlarmManager.AlarmClockInfo(triggerTime, showPi)
-            alarmManager.setAlarmClock(clockInfo, pi)
-        } catch (e: SecurityException) {
-            alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerTime, pi)
-        }
-    }
-    private fun cancelHardwareAlarm() {
-        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val intent = Intent(this, AlarmReceiver::class.java).apply {
-            action = "com.example.bililivealarm.ACTION_ALARM_POLL"
-        }
-        val pi = PendingIntent.getBroadcast(
-            this, 1001, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        alarmManager.cancel(pi)
-    }
-    private fun checkAllStreamersStatus() {
-        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-        val snapshotArr = JSONArray(prefs.getString("STREAMER_LIST", "[]") ?: "[]")
-        if (snapshotArr.length() == 0) {
-            stopAlarmImmediately(this)
-            return
-        }
-        val queryBuilder = StringBuilder("https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids?")
-        val uidList = mutableListOf<String>()
-        for (i in 0 until snapshotArr.length()) {
-            val uid = snapshotArr.getJSONObject(i).optString("uid")
-            if (uid.isNotEmpty()) {
-                uidList.add(uid)
-                queryBuilder.append("uids[]=").append(uid).append("&")
-            }
-        }
-        if (uidList.isEmpty()) return
-        queryBuilder.append("_t=").append(System.currentTimeMillis())
-        try {
-            val url = URL(queryBuilder.toString())
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "GET"
-            conn.useCaches = false
-            conn.connectTimeout = 6000
-            conn.readTimeout = 6000
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
-            conn.setRequestProperty("Referer", "https://live.bilibili.com/")
-            conn.setRequestProperty("Cache-Control", "no-cache")
-            conn.setRequestProperty("Connection", "close")
-            if (conn.responseCode == 200) {
-                val text = BufferedReader(InputStreamReader(conn.inputStream)).readText()
-                val json = JSONObject(text)
-                if (json.optInt("code") == 0) {
-                    val dataObj = json.optJSONObject("data")
-                    val latestArr = JSONArray(prefs.getString("STREAMER_LIST", "[]") ?: "[]")
-                    val isMonitoring = prefs.getBoolean("IS_MONITORING", false)
-                    val notifiedSet = (prefs.getStringSet("NOTIFIED_UIDS", emptySet()) ?: emptySet()).toMutableSet()
-                    var firstNewlyLive: JSONObject? = null
-                    val newlyLiveNames = mutableListOf<String>()
-                    val newlyLiveUids = mutableListOf<String>()
-                    val activeUidsInList = mutableSetOf<String>()
-                    for (i in 0 until latestArr.length()) {
-                        val item = latestArr.getJSONObject(i)
-                        val uid = item.optString("uid")
-                        activeUidsInList.add(uid)
-                        val info = dataObj?.optJSONObject(uid)
-                        if (info != null) {
-                            val liveStatus = info.optInt("live_status", 0)
-                            val liveTime = info.optString("live_time", "0").trim()
-                            val sessionKey = "${uid}_${liveTime}"
-                            val uname = info.optString("uname", item.optString("uname"))
-                            val title = info.optString("title", "")
-                            val face = info.optString("face", item.optString("face"))
-                            val roomId = info.optString("room_id", item.optString("room_id"))
-                            item.put("uname", uname)
-                            item.put("live_status", liveStatus)
-                            item.put("title", title)
-                            item.put("room_id", roomId)
-                            if (face.isNotEmpty()) {
-                                item.put("face", face)
-                            }
-                            if (liveStatus == 1) {
-                                if (isMonitoring && !notifiedSet.contains(sessionKey)) {
-                                    notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
-                                    notifiedSet.add(sessionKey)
-                                    newlyLiveNames.add(uname)
-                                    newlyLiveUids.add(uid)
-                                    if (firstNewlyLive == null) {
-                                        firstNewlyLive = item
-                                    }
-                                }
-                            } else {
-                                notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
-                                currentlyRingingUids.remove(uid)
-                            }
-                        } else {
-                            item.put("live_status", 0)
-                            notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
-                            currentlyRingingUids.remove(uid)
-                        }
-                    }
-                    if (!currentlyRingingUids.contains("TEST_UID")) {
-                        currentlyRingingUids.retainAll(activeUidsInList)
-                        if (currentlyRingingUids.isEmpty() && prefs.getBoolean("IS_RINGING", false)) {
-                            stopAlarmImmediately(this)
-                        }
-                    }
-                    prefs.edit()
-                        .putString("STREAMER_LIST", latestArr.toString())
-                        .putStringSet("NOTIFIED_UIDS", notifiedSet)
-                        .commit()
-                    sendBroadcast(Intent("com.example.bililivealarm.ACTION_STATUS_UPDATED").setPackage(packageName))
-                    if (firstNewlyLive != null && isMonitoring) {
-                        currentlyRingingUids.addAll(newlyLiveUids)
-                        val allNames = newlyLiveNames.joinToString("、")
-                        triggerAlarmAndPopup(
-                            allNames,
-                            firstNewlyLive.optString("title", "正在直播中"),
-                            firstNewlyLive.optString("face", ""),
-                            firstNewlyLive.optString("uid", ""),
-                            firstNewlyLive.optString("room_id", "")
-                        )
-                    }
-                }
-            }
-            conn.disconnect()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-    private fun triggerAlarmAndPopup(uname: String, title: String, face: String, uid: String, roomId: String) {
-        wakeUpScreenForAlert()
-        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-        prefs.edit()
-            .putBoolean("IS_RINGING", true)
-            .putString("RINGING_UNAME", uname)
-            .putString("RINGING_TITLE", title)
-            .putString("RINGING_FACE", face)
-            .putString("RINGING_UID", uid)
-            .putString("RINGING_ROOM_ID", roomId)
-            .commit()
-        sendBroadcast(Intent("com.example.bililivealarm.ACTION_STATUS_UPDATED").setPackage(packageName))
-        val popupIntent = Intent(this, AlarmPopupActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            putExtra("UNAME", uname)
-            putExtra("TITLE", title)
-            putExtra("FACE", face)
-            putExtra("UID", uid)
-            putExtra("ROOM_ID", roomId)
-        }
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.cancel(2002)
-        manager.notify(2002, buildHighPriorityAlertNotification(uname, title, uid, roomId, popupIntent))
-        mainHandler.post {
-            val overlayShown = showSystemOverlayPopup(uname, title, face, uid, roomId)
-            if (!overlayShown) {
-                try {
-                    startActivity(popupIntent)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-            }
-        }
-        startSoundAndVibrationByMode()
     }
     private fun showSystemOverlayPopup(uname: String, title: String, face: String, uid: String, roomId: String): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
@@ -688,14 +444,6 @@ class LiveMonitorService : Service() {
     private fun createNotificationChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = getSystemService(NotificationManager::class.java)
-            val serviceChannel = NotificationChannel(
-                "BILI_SERVICE_SILENT_CH",
-                "后台监控状态",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                setSound(null, null)
-                enableVibration(false)
-            }
             val alertChannel = NotificationChannel(
                 "BILI_ALARM_POPUP_HIGH_CH",
                 "主播开播强提醒",
@@ -704,41 +452,24 @@ class LiveMonitorService : Service() {
                 enableVibration(true)
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
-            manager.createNotificationChannel(serviceChannel)
             manager.createNotificationChannel(alertChannel)
         }
     }
-    private fun buildSilentServiceNotification(content: String): Notification {
-        val mainIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val mainPi = PendingIntent.getActivity(
-            this, 0, mainIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        return NotificationCompat.Builder(this, "BILI_SERVICE_SILENT_CH")
-            .setContentTitle("靓仔监控")
-            .setContentText(content)
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentIntent(mainPi)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setOngoing(true)
-            .build()
-    }
     private fun buildHighPriorityAlertNotification(uname: String, title: String, uid: String, roomId: String, fullScreenPopupIntent: Intent): Notification {
-        val watchIntent = Intent(this, LiveMonitorService::class.java).apply {
-            action = "ACTION_WATCH_LIVE"
+        val watchIntent = Intent(this, AlarmPopupActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("AUTO_OPEN_LIVE", true)
             putExtra("UID", uid)
             putExtra("ROOM_ID", roomId)
         }
-        val watchPi = PendingIntent.getService(
+        val watchPi = PendingIntent.getActivity(
             this, 13, watchIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val muteIntent = Intent(this, LiveMonitorService::class.java).apply {
-            action = "ACTION_MUTE_ALARM"
+        val muteIntent = Intent(this, AlarmReceiver::class.java).apply {
+            action = "com.example.bililivealarm.ACTION_MUTE_FROM_NOTIF"
         }
-        val mutePi = PendingIntent.getService(
+        val mutePi = PendingIntent.getBroadcast(
             this, 11, muteIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
@@ -751,31 +482,17 @@ class LiveMonitorService : Service() {
             .setContentText("直播间：$title")
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(watchPi)
+            .setDeleteIntent(mutePi)
             .addAction(android.R.drawable.ic_media_play, "去看直播", watchPi)
             .addAction(android.R.drawable.ic_lock_silent_mode, "我知道了", mutePi)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setFullScreenIntent(fullScreenPi, true)
-            .setAutoCancel(false)
-            .setOngoing(true)
+            .setAutoCancel(true)
             .build()
     }
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-        if (prefs.getBoolean("IS_MONITORING", false)) {
-            scheduleNextHardwareAlarm(5)
-        }
-        super.onTaskRemoved(rootIntent)
-    }
     override fun onDestroy() {
-        mainHandler.removeCallbacks(internalLoopRunnable)
-        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-        if (prefs.getBoolean("IS_MONITORING", false)) {
-            scheduleNextHardwareAlarm(5)
-        } else {
-            cancelHardwareAlarm()
-        }
-        stopAlarmImmediately(this)
+        removeSystemOverlayPopupImmediate()
         if (instance === this) instance = null
         super.onDestroy()
     }

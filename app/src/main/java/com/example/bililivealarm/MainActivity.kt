@@ -64,6 +64,7 @@ class MainActivity : AppCompatActivity() {
         override fun onReceive(context: Context?, intent: Intent?) {
             loadSavedStreamers()
             updateRingingBannerUI()
+            updateStatusText()
         }
     }
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -95,16 +96,9 @@ class MainActivity : AppCompatActivity() {
             hideKeyboard(etInterval)
             val seconds = saveIntervalSetting(true)
             if (prefs.getBoolean("IS_MONITORING", false)) {
-                val updateIntent = Intent(this, LiveMonitorService::class.java).apply {
-                    action = "ACTION_UPDATE_INTERVAL"
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(updateIntent)
-                } else {
-                    startService(updateIntent)
-                }
-                tvStatus.text = "当前状态：监控运行中，每${seconds}秒检测"
+                AlarmReceiver.scheduleNextAlarm(this, seconds)
             }
+            updateStatusText()
         }
         btnBannerDismiss.setOnClickListener {
             muteCurrentAlarm()
@@ -126,14 +120,16 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
             Toast.makeText(this, "3秒后将触发弹窗，可切到桌面测试", Toast.LENGTH_LONG).show()
-            val testIntent = Intent(this, LiveMonitorService::class.java).apply {
-                action = "ACTION_TEST_POPUP"
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(testIntent)
-            } else {
-                startService(testIntent)
-            }
+            val appCtx = applicationContext
+            mainHandler.postDelayed({
+                val arr = JSONArray(appCtx.getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE).getString("STREAMER_LIST", "[]") ?: "[]")
+                val firstObj = if (arr.length() > 0) arr.getJSONObject(0) else null
+                val testName = firstObj?.optString("uname", "测试主播") ?: "测试主播"
+                val testTitle = firstObj?.optString("title")?.takeIf { it.isNotEmpty() } ?: "开播弹窗测试"
+                val testFace = firstObj?.optString("face", "") ?: ""
+                val testRoomId = firstObj?.optString("room_id", "") ?: ""
+                AlarmReceiver.triggerAlarm(appCtx, testName, testTitle, testFace, "TEST_UID", testRoomId)
+            }, 3000)
         }
         when (prefs.getInt("ALERT_MODE", 0)) {
             1 -> rbVibrateOnly.isChecked = true
@@ -148,14 +144,7 @@ class MainActivity : AppCompatActivity() {
             }
             prefs.edit().putInt("ALERT_MODE", mode).apply()
             if (prefs.getBoolean("IS_RINGING", false)) {
-                val applyIntent = Intent(this, LiveMonitorService::class.java).apply {
-                    action = "ACTION_APPLY_ALERT_MODE"
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(applyIntent)
-                } else {
-                    startService(applyIntent)
-                }
+                LiveMonitorService.applyAlertModeIfRinging()
             }
         }
         streamerAdapter = StreamerListAdapter()
@@ -199,10 +188,7 @@ class MainActivity : AppCompatActivity() {
         })
         loadSavedStreamers()
         updateRingingBannerUI()
-        refreshLiveStatusImmediately()
-        if (prefs.getBoolean("IS_MONITORING", false)) {
-            tvStatus.text = "当前状态：监控运行中，每${savedInterval}秒检测"
-        }
+        updateStatusText()
         lvStreamers.setOnItemClickListener { _, _, position, _ ->
             val target = streamerDataList[position]
             val uname = target.optString("uname")
@@ -230,23 +216,34 @@ class MainActivity : AppCompatActivity() {
             prefs.edit()
                 .putBoolean("IS_MONITORING", true)
                 .putStringSet("NOTIFIED_UIDS", emptySet())
-                .apply()
-            refreshLiveStatusImmediately()
-            tvStatus.text = "当前状态：监控运行中，每${seconds}秒检测"
+                .commit()
+            AlarmReceiver.scheduleNextAlarm(this, seconds)
+            AlarmReceiver.checkNowAsync(this)
+            updateStatusText()
             Toast.makeText(this, "已开始监控，每${seconds}秒检测一次", Toast.LENGTH_SHORT).show()
         }
         btnRefreshStatus.setOnClickListener {
-            prefs.edit().putStringSet("NOTIFIED_UIDS", emptySet()).apply()
+            prefs.edit().putStringSet("NOTIFIED_UIDS", emptySet()).commit()
             Toast.makeText(this, "正在刷新开播状态", Toast.LENGTH_SHORT).show()
-            refreshLiveStatusImmediately()
+            AlarmReceiver.checkNowAsync(this)
         }
         btnStopMonitor.setOnClickListener {
             prefs.edit()
                 .putBoolean("IS_MONITORING", false)
                 .putBoolean("IS_RINGING", false)
-                .apply()
-            stopService(Intent(this, LiveMonitorService::class.java))
+                .commit()
+            AlarmReceiver.cancelAlarm(this)
+            LiveMonitorService.stopAlarmImmediately(this)
             updateRingingBannerUI()
+            updateStatusText()
+        }
+    }
+    private fun updateStatusText() {
+        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("IS_MONITORING", false)) {
+            val interval = prefs.getInt("POLL_INTERVAL_SECONDS", 20).coerceAtLeast(5)
+            tvStatus.text = "当前状态：监控运行中，每${interval}秒检测"
+        } else {
             tvStatus.text = "当前状态：已停止监控"
         }
     }
@@ -267,7 +264,7 @@ class MainActivity : AppCompatActivity() {
         getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
             .edit()
             .putInt("POLL_INTERVAL_SECONDS", seconds)
-            .apply()
+            .commit()
         return seconds
     }
     private fun muteCurrentAlarm() {
@@ -280,28 +277,21 @@ class MainActivity : AppCompatActivity() {
         val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
         val notifiedSet = (prefs.getStringSet("NOTIFIED_UIDS", emptySet()) ?: emptySet()).toMutableSet()
         notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
-        prefs.edit().putStringSet("NOTIFIED_UIDS", notifiedSet).apply()
+        prefs.edit().putStringSet("NOTIFIED_UIDS", notifiedSet).commit()
         saveStreamers()
         if (streamerDataList.isEmpty()) {
             prefs.edit()
                 .putBoolean("IS_MONITORING", false)
                 .putBoolean("IS_RINGING", false)
-                .apply()
-            stopService(Intent(this, LiveMonitorService::class.java))
-            tvStatus.text = "当前状态：已停止监控"
-        } else {
-            val removeIntent = Intent(this, LiveMonitorService::class.java).apply {
-                action = "ACTION_REMOVE_UID"
-                putExtra("UID", uid)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(removeIntent)
-            } else {
-                startService(removeIntent)
-            }
+                .commit()
+            AlarmReceiver.cancelAlarm(this)
+            LiveMonitorService.stopAlarmImmediately(this)
+        } else if (prefs.getString("RINGING_UID", "") == uid) {
+            LiveMonitorService.stopAlarmImmediately(this)
         }
         streamerAdapter.notifyDataSetChanged()
         updateRingingBannerUI()
+        updateStatusText()
     }
     private fun openBiliLiveOrSpace(uid: String, roomId: String) {
         try {
@@ -350,7 +340,13 @@ class MainActivity : AppCompatActivity() {
         }
         loadSavedStreamers()
         updateRingingBannerUI()
-        refreshLiveStatusImmediately()
+        updateStatusText()
+        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("IS_MONITORING", false)) {
+            val interval = prefs.getInt("POLL_INTERVAL_SECONDS", 20).coerceAtLeast(5)
+            AlarmReceiver.scheduleNextAlarm(this, interval)
+            AlarmReceiver.checkNowAsync(this)
+        }
     }
     override fun onStop() {
         super.onStop()
@@ -358,15 +354,6 @@ class MainActivity : AppCompatActivity() {
             unregisterReceiver(statusReceiver)
         } catch (e: Exception) {
             e.printStackTrace()
-        }
-    }
-    private fun refreshLiveStatusImmediately() {
-        if (streamerDataList.isEmpty()) return
-        val serviceIntent = Intent(this, LiveMonitorService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
         }
     }
     private fun searchStreamerForDropdown(keyword: String) {
@@ -453,7 +440,7 @@ class MainActivity : AppCompatActivity() {
         val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
         val notifiedSet = (prefs.getStringSet("NOTIFIED_UIDS", emptySet()) ?: emptySet()).toMutableSet()
         notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
-        prefs.edit().putStringSet("NOTIFIED_UIDS", notifiedSet).apply()
+        prefs.edit().putStringSet("NOTIFIED_UIDS", notifiedSet).commit()
         val obj = JSONObject().apply {
             put("uid", uid)
             put("uname", uname)
@@ -465,7 +452,7 @@ class MainActivity : AppCompatActivity() {
         streamerDataList.add(obj)
         saveStreamers()
         streamerAdapter.notifyDataSetChanged()
-        refreshLiveStatusImmediately()
+        AlarmReceiver.checkNowAsync(this)
     }
     private fun loadSavedStreamers() {
         val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
@@ -485,7 +472,7 @@ class MainActivity : AppCompatActivity() {
         getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
             .edit()
             .putString("STREAMER_LIST", arr.toString())
-            .apply()
+            .commit()
     }
     private fun formatFansCount(fans: Int): String {
         if (fans < 0) return "UID精准匹配"

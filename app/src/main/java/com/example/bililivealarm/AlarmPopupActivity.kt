@@ -27,6 +27,14 @@ class AlarmPopupActivity : AppCompatActivity() {
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (intent.getBooleanExtra("AUTO_OPEN_LIVE", false)) {
+            val uid = intent.getStringExtra("UID") ?: ""
+            val roomId = intent.getStringExtra("ROOM_ID") ?: ""
+            LiveMonitorService.stopAlarmImmediately(this)
+            openBiliLive(uid, roomId)
+            finish()
+            return
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
@@ -151,6 +159,14 @@ class AlarmPopupActivity : AppCompatActivity() {
     }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        if (intent.getBooleanExtra("AUTO_OPEN_LIVE", false)) {
+            val uid = intent.getStringExtra("UID") ?: ""
+            val roomId = intent.getStringExtra("ROOM_ID") ?: ""
+            LiveMonitorService.stopAlarmImmediately(this)
+            openBiliLive(uid, roomId)
+            finish()
+            return
+        }
         updateUI(intent)
     }
     private fun updateUI(intent: Intent) {
