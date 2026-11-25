@@ -74,8 +74,9 @@ class AlarmReceiver : BroadcastReceiver() {
                 }
             }
         }
-        fun triggerAlarm(context: Context, uname: String, title: String, face: String, uid: String, roomId: String) {
+        fun triggerAlarm(context: Context, uname: String, title: String, face: String, uid: String, roomId: String, uids: List<String> = listOf(uid)) {
             val appCtx = context.applicationContext
+            val validUids = uids.filter { it.isNotEmpty() }.ifEmpty { if (uid.isNotEmpty()) listOf(uid) else emptyList() }
             val serviceIntent = Intent(appCtx, LiveMonitorService::class.java).apply {
                 action = "ACTION_START_ALARM"
                 putExtra("UNAME", uname)
@@ -83,6 +84,7 @@ class AlarmReceiver : BroadcastReceiver() {
                 putExtra("FACE", face)
                 putExtra("UID", uid)
                 putExtra("ROOM_ID", roomId)
+                putStringArrayListExtra("UIDS", ArrayList(validUids))
             }
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -92,6 +94,12 @@ class AlarmReceiver : BroadcastReceiver() {
                 }
             } catch (e: Exception) {
                 val prefs = appCtx.getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+                val mergedUids = if (prefs.getBoolean("IS_RINGING", false)) {
+                    (prefs.getStringSet("RINGING_UIDS", emptySet()) ?: emptySet()).toMutableSet()
+                } else {
+                    mutableSetOf()
+                }
+                mergedUids.addAll(validUids)
                 prefs.edit()
                     .putBoolean("IS_RINGING", true)
                     .putString("RINGING_UNAME", uname)
@@ -99,6 +107,7 @@ class AlarmReceiver : BroadcastReceiver() {
                     .putString("RINGING_FACE", face)
                     .putString("RINGING_UID", uid)
                     .putString("RINGING_ROOM_ID", roomId)
+                    .putStringSet("RINGING_UIDS", mergedUids.toSet())
                     .commit()
                 appCtx.sendBroadcast(Intent("com.example.bililivealarm.ACTION_STATUS_UPDATED").setPackage(appCtx.packageName))
                 wakeScreen(appCtx)
@@ -143,6 +152,7 @@ class AlarmReceiver : BroadcastReceiver() {
                         val notifiedSet = (prefs.getStringSet("NOTIFIED_UIDS", emptySet()) ?: emptySet()).toMutableSet()
                         val liveUidsNow = mutableSetOf<String>()
                         val newlyLiveNames = mutableListOf<String>()
+                        val newlyLiveUids = mutableListOf<String>()
                         var firstLive: JSONObject? = null
                         for (i in 0 until latestArr.length()) {
                             val item = latestArr.getJSONObject(i)
@@ -167,6 +177,7 @@ class AlarmReceiver : BroadcastReceiver() {
                                         notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
                                         notifiedSet.add(sessionKey)
                                         newlyLiveNames.add(uname)
+                                        newlyLiveUids.add(uid)
                                         if (firstLive == null) firstLive = item
                                     }
                                 } else {
@@ -177,17 +188,30 @@ class AlarmReceiver : BroadcastReceiver() {
                                 notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
                             }
                         }
+                        var shouldStopRinging = false
+                        val ringingUids = (prefs.getStringSet("RINGING_UIDS", emptySet()) ?: emptySet()).toMutableSet()
                         if (prefs.getBoolean("IS_RINGING", false)) {
-                            val ringingUid = prefs.getString("RINGING_UID", "") ?: ""
-                            if (ringingUid.isNotEmpty() && ringingUid != "TEST_UID" && !liveUidsNow.contains(ringingUid)) {
-                                LiveMonitorService.stopAlarmImmediately(context)
+                            val fallbackUid = prefs.getString("RINGING_UID", "") ?: ""
+                            if (ringingUids.isEmpty() && fallbackUid.isNotEmpty()) {
+                                ringingUids.add(fallbackUid)
+                            }
+                            if (!ringingUids.contains("TEST_UID")) {
+                                ringingUids.retainAll(liveUidsNow)
+                                if (ringingUids.isEmpty() && firstLive == null) {
+                                    shouldStopRinging = true
+                                }
                             }
                         }
                         prefs.edit()
                             .putString("STREAMER_LIST", latestArr.toString())
-                            .putStringSet("NOTIFIED_UIDS", notifiedSet)
+                            .putStringSet("NOTIFIED_UIDS", notifiedSet.toSet())
+                            .putStringSet("RINGING_UIDS", ringingUids.toSet())
                             .commit()
-                        context.sendBroadcast(Intent("com.example.bililivealarm.ACTION_STATUS_UPDATED").setPackage(context.packageName))
+                        if (shouldStopRinging) {
+                            LiveMonitorService.stopAlarmImmediately(context)
+                        } else {
+                            context.sendBroadcast(Intent("com.example.bililivealarm.ACTION_STATUS_UPDATED").setPackage(context.packageName))
+                        }
                         if (firstLive != null && isMonitoring) {
                             triggerAlarm(
                                 context,
@@ -195,7 +219,8 @@ class AlarmReceiver : BroadcastReceiver() {
                                 firstLive.optString("title", "正在直播中"),
                                 firstLive.optString("face", ""),
                                 firstLive.optString("uid", ""),
-                                firstLive.optString("room_id", "")
+                                firstLive.optString("room_id", ""),
+                                newlyLiveUids
                             )
                         }
                     }

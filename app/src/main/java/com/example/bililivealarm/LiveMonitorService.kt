@@ -32,63 +32,93 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 class LiveMonitorService : Service() {
     companion object {
         @Volatile
         private var instance: LiveMonitorService? = null
+        private val alarmLock = Any()
         private val activePlayers = mutableListOf<MediaPlayer>()
-        @Synchronized
         fun nextAlertNotifId(context: Context): Int {
-            val prefs = context.getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-            val oldId = prefs.getInt("LAST_ALERT_NOTIF_ID", 2002)
-            val newId = if (oldId in 2002..2998) oldId + 1 else 2002
-            prefs.edit().putInt("LAST_ALERT_NOTIF_ID", newId).commit()
-            try {
-                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.cancel(oldId)
-            } catch (e: Exception) {}
-            return newId
+            synchronized(alarmLock) {
+                val prefs = context.getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+                val oldId = prefs.getInt("LAST_ALERT_NOTIF_ID", 2002)
+                val newId = if (oldId in 2002..2998) oldId + 1 else 2002
+                prefs.edit().putInt("LAST_ALERT_NOTIF_ID", newId).commit()
+                try {
+                    val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    nm.cancel(oldId)
+                } catch (e: Exception) {}
+                return newId
+            }
         }
         fun applyAlertModeIfRinging() {
             instance?.startSoundAndVibrationByMode()
         }
-        @Synchronized
         fun stopAlarmImmediately(context: Context) {
-            for (player in activePlayers) {
-                try {
-                    if (player.isPlaying) player.stop()
-                } catch (e: Exception) {}
-                try {
-                    player.release()
-                } catch (e: Exception) {}
-            }
-            activePlayers.clear()
-            try {
-                val vib = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
-                } else {
-                    @Suppress("DEPRECATION")
-                    context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            synchronized(alarmLock) {
+                for (player in activePlayers) {
+                    try {
+                        if (player.isPlaying) player.stop()
+                    } catch (e: Exception) {}
+                    try {
+                        player.release()
+                    } catch (e: Exception) {}
                 }
-                vib.cancel()
-            } catch (e: Exception) {}
-            val prefs = context.getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-            val lastAlertId = prefs.getInt("LAST_ALERT_NOTIF_ID", 2002)
-            prefs.edit().putBoolean("IS_RINGING", false).commit()
-            try {
-                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.cancel(lastAlertId)
-                nm.cancel(2002)
-            } catch (e: Exception) {}
-            instance?.stopServiceCleanly()
-            context.sendBroadcast(Intent("com.example.bililivealarm.ACTION_ALARM_STOPPED").setPackage(context.packageName))
-            context.sendBroadcast(Intent("com.example.bililivealarm.ACTION_STATUS_UPDATED").setPackage(context.packageName))
+                activePlayers.clear()
+                try {
+                    val vib = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+                    } else {
+                        @Suppress("DEPRECATION")
+                        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                    }
+                    vib.cancel()
+                } catch (e: Exception) {}
+                val prefs = context.getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+                prefs.edit()
+                    .putBoolean("IS_RINGING", false)
+                    .putStringSet("RINGING_UIDS", emptySet())
+                    .commit()
+                try {
+                    val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    nm.cancelAll()
+                } catch (e: Exception) {}
+                instance?.stopServiceCleanly()
+                context.sendBroadcast(Intent("com.example.bililivealarm.ACTION_ALARM_STOPPED").setPackage(context.packageName))
+                context.sendBroadcast(Intent("com.example.bililivealarm.ACTION_STATUS_UPDATED").setPackage(context.packageName))
+            }
         }
     }
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val watchdogExecutor = Executors.newSingleThreadExecutor()
+    private val isWatchdogChecking = AtomicBoolean(false)
     private var vibrator: Vibrator? = null
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
+    private val ringingWatchdogRunnable = object : Runnable {
+        override fun run() {
+            val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+            if (!prefs.getBoolean("IS_RINGING", false)) return
+            if (isWatchdogChecking.compareAndSet(false, true)) {
+                watchdogExecutor.execute {
+                    try {
+                        checkRingingStreamersStillLive()
+                    } finally {
+                        isWatchdogChecking.set(false)
+                    }
+                }
+            }
+            mainHandler.postDelayed(this, 5000L)
+        }
+    }
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onCreate() {
         super.onCreate()
@@ -116,7 +146,9 @@ class LiveMonitorService : Service() {
                 val face = intent.getStringExtra("FACE") ?: ""
                 val uid = intent.getStringExtra("UID") ?: ""
                 val roomId = intent.getStringExtra("ROOM_ID") ?: ""
-                triggerAlarmAndPopup(uname, title, face, uid, roomId)
+                val uids = intent.getStringArrayListExtra("UIDS")?.filter { it.isNotEmpty() }
+                    ?: if (uid.isNotEmpty()) listOf(uid) else emptyList()
+                triggerAlarmAndPopup(uname, title, face, uid, roomId, uids)
                 return START_NOT_STICKY
             }
         }
@@ -124,6 +156,7 @@ class LiveMonitorService : Service() {
         return START_NOT_STICKY
     }
     private fun stopServiceCleanly() {
+        mainHandler.removeCallbacks(ringingWatchdogRunnable)
         removeSystemOverlayPopup()
         mainHandler.post {
             try {
@@ -136,6 +169,124 @@ class LiveMonitorService : Service() {
             } catch (e: Exception) {}
             stopSelf()
         }
+    }
+    private fun checkRingingStreamersStillLive() {
+        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+        if (!prefs.getBoolean("IS_RINGING", false)) {
+            stopAlarmImmediately(this)
+            return
+        }
+        val ringingUids = (prefs.getStringSet("RINGING_UIDS", emptySet()) ?: emptySet()).toMutableSet()
+        val fallbackUid = prefs.getString("RINGING_UID", "") ?: ""
+        if (ringingUids.isEmpty() && fallbackUid.isNotEmpty()) {
+            ringingUids.add(fallbackUid)
+        }
+        if (ringingUids.contains("TEST_UID")) return
+        if (ringingUids.isEmpty()) {
+            stopAlarmImmediately(this)
+            return
+        }
+        val latestArr = JSONArray(prefs.getString("STREAMER_LIST", "[]") ?: "[]")
+        val roomMap = mutableMapOf<String, String>()
+        for (i in 0 until latestArr.length()) {
+            val item = latestArr.getJSONObject(i)
+            val uid = item.optString("uid")
+            val roomId = item.optString("room_id")
+            if (uid.isNotEmpty()) roomMap[uid] = roomId
+        }
+        val fallbackRoomId = prefs.getString("RINGING_ROOM_ID", "") ?: ""
+        if (fallbackUid.isNotEmpty() && fallbackRoomId.isNotEmpty() && roomMap[fallbackUid].isNullOrEmpty()) {
+            roomMap[fallbackUid] = fallbackRoomId
+        }
+        val offlineUids = mutableSetOf<String>()
+        for (uid in ringingUids.toList()) {
+            val roomId = roomMap[uid] ?: ""
+            val isLive = querySingleStreamerLiveStatus(uid, roomId)
+            if (isLive == false) {
+                offlineUids.add(uid)
+            }
+        }
+        if (offlineUids.isNotEmpty()) {
+            ringingUids.removeAll(offlineUids)
+            val notifiedSet = (prefs.getStringSet("NOTIFIED_UIDS", emptySet()) ?: emptySet()).toMutableSet()
+            for (uid in offlineUids) {
+                notifiedSet.removeAll { it.startsWith("${uid}_") || it == uid }
+            }
+            for (i in 0 until latestArr.length()) {
+                val item = latestArr.getJSONObject(i)
+                if (offlineUids.contains(item.optString("uid"))) {
+                    item.put("live_status", 0)
+                }
+            }
+            prefs.edit()
+                .putString("STREAMER_LIST", latestArr.toString())
+                .putStringSet("NOTIFIED_UIDS", notifiedSet.toSet())
+                .putStringSet("RINGING_UIDS", ringingUids.toSet())
+                .commit()
+            if (ringingUids.isEmpty()) {
+                stopAlarmImmediately(this)
+            } else {
+                sendBroadcast(Intent("com.example.bililivealarm.ACTION_STATUS_UPDATED").setPackage(packageName))
+            }
+        }
+    }
+    private fun querySingleStreamerLiveStatus(uid: String, roomId: String): Boolean? {
+        if (roomId.isNotEmpty() && roomId != "0") {
+            try {
+                val url = URL("https://api.live.bilibili.com/room/v1/Room/get_info?room_id=$roomId&_t=${System.currentTimeMillis()}")
+                val conn = url.openConnection() as HttpURLConnection
+                conn.requestMethod = "GET"
+                conn.useCaches = false
+                conn.connectTimeout = 4000
+                conn.readTimeout = 4000
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                conn.setRequestProperty("Referer", "https://live.bilibili.com/")
+                conn.setRequestProperty("Cache-Control", "no-cache")
+                conn.setRequestProperty("Connection", "close")
+                val code = conn.responseCode
+                if (code == 200) {
+                    val text = BufferedReader(InputStreamReader(conn.inputStream)).readText()
+                    conn.disconnect()
+                    val json = JSONObject(text)
+                    if (json.optInt("code") == 0) {
+                        val liveStatus = json.optJSONObject("data")?.optInt("live_status", 0) ?: 0
+                        return liveStatus == 1
+                    }
+                } else {
+                    conn.disconnect()
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+        try {
+            val url = URL("https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids?uids[]=$uid&_t=${System.currentTimeMillis()}")
+            val conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.useCaches = false
+            conn.connectTimeout = 4000
+            conn.readTimeout = 4000
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+            conn.setRequestProperty("Referer", "https://live.bilibili.com/")
+            conn.setRequestProperty("Cache-Control", "no-cache")
+            conn.setRequestProperty("Connection", "close")
+            val code = conn.responseCode
+            if (code == 200) {
+                val text = BufferedReader(InputStreamReader(conn.inputStream)).readText()
+                conn.disconnect()
+                val json = JSONObject(text)
+                if (json.optInt("code") == 0) {
+                    val info = json.optJSONObject("data")?.optJSONObject(uid)
+                    val liveStatus = info?.optInt("live_status", 0) ?: 0
+                    return liveStatus == 1
+                }
+            } else {
+                conn.disconnect()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return null
     }
     private fun wakeUpScreenForAlert() {
         try {
@@ -154,9 +305,15 @@ class LiveMonitorService : Service() {
             e.printStackTrace()
         }
     }
-    private fun triggerAlarmAndPopup(uname: String, title: String, face: String, uid: String, roomId: String) {
+    private fun triggerAlarmAndPopup(uname: String, title: String, face: String, uid: String, roomId: String, uids: List<String>) {
         wakeUpScreenForAlert()
         val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+        val mergedUids = if (prefs.getBoolean("IS_RINGING", false)) {
+            (prefs.getStringSet("RINGING_UIDS", emptySet()) ?: emptySet()).toMutableSet()
+        } else {
+            mutableSetOf()
+        }
+        mergedUids.addAll(uids)
         prefs.edit()
             .putBoolean("IS_RINGING", true)
             .putString("RINGING_UNAME", uname)
@@ -164,6 +321,7 @@ class LiveMonitorService : Service() {
             .putString("RINGING_FACE", face)
             .putString("RINGING_UID", uid)
             .putString("RINGING_ROOM_ID", roomId)
+            .putStringSet("RINGING_UIDS", mergedUids.toSet())
             .commit()
         val popupIntent = Intent(this, AlarmPopupActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -188,6 +346,10 @@ class LiveMonitorService : Service() {
             }
         }
         startSoundAndVibrationByMode()
+        mainHandler.removeCallbacks(ringingWatchdogRunnable)
+        if (!mergedUids.contains("TEST_UID")) {
+            mainHandler.postDelayed(ringingWatchdogRunnable, 5000L)
+        }
     }
     private fun startForegroundCompat(id: Int, notification: Notification) {
         try {
@@ -389,55 +551,57 @@ class LiveMonitorService : Service() {
             }
         }
     }
-    @Synchronized
     private fun startSoundAndVibrationByMode() {
-        val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
-        val alertMode = prefs.getInt("ALERT_MODE", 0)
-        for (player in activePlayers) {
-            try {
-                if (player.isPlaying) player.stop()
-            } catch (e: Exception) {}
-            try {
-                player.release()
-            } catch (e: Exception) {}
-        }
-        activePlayers.clear()
-        try {
-            vibrator?.cancel()
-        } catch (e: Exception) {}
-        val alarmAudioAttrs = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_ALARM)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-            .build()
-        if (alertMode == 0 || alertMode == 2) {
-            try {
-                val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-                    ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-                val newPlayer = MediaPlayer().apply {
-                    setDataSource(applicationContext, alarmUri)
-                    setAudioAttributes(alarmAudioAttrs)
-                    isLooping = true
-                    prepare()
-                    start()
-                }
-                activePlayers.add(newPlayer)
-            } catch (e: Exception) {
-                e.printStackTrace()
+        synchronized(alarmLock) {
+            val prefs = getSharedPreferences("BiliPrefs", Context.MODE_PRIVATE)
+            if (!prefs.getBoolean("IS_RINGING", false)) return
+            val alertMode = prefs.getInt("ALERT_MODE", 0)
+            for (player in activePlayers) {
+                try {
+                    if (player.isPlaying) player.stop()
+                } catch (e: Exception) {}
+                try {
+                    player.release()
+                } catch (e: Exception) {}
             }
-        }
-        if (alertMode == 0 || alertMode == 1) {
+            activePlayers.clear()
             try {
-                val pattern = longArrayOf(0, 1000, 500, 1000)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    val effect = VibrationEffect.createWaveform(pattern, 0)
-                    @Suppress("DEPRECATION")
-                    vibrator?.vibrate(effect, alarmAudioAttrs)
-                } else {
-                    @Suppress("DEPRECATION")
-                    vibrator?.vibrate(pattern, 0)
+                vibrator?.cancel()
+            } catch (e: Exception) {}
+            val alarmAudioAttrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ALARM)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            if (alertMode == 0 || alertMode == 2) {
+                try {
+                    val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                        ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                    val newPlayer = MediaPlayer().apply {
+                        setDataSource(applicationContext, alarmUri)
+                        setAudioAttributes(alarmAudioAttrs)
+                        isLooping = true
+                        prepare()
+                        start()
+                    }
+                    activePlayers.add(newPlayer)
+                } catch (e: Exception) {
+                    e.printStackTrace()
                 }
-            } catch (e: Exception) {
-                e.printStackTrace()
+            }
+            if (alertMode == 0 || alertMode == 1) {
+                try {
+                    val pattern = longArrayOf(0, 1000, 500, 1000)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        val effect = VibrationEffect.createWaveform(pattern, 0)
+                        @Suppress("DEPRECATION")
+                        vibrator?.vibrate(effect, alarmAudioAttrs)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        vibrator?.vibrate(pattern, 0)
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
             }
         }
     }
@@ -492,6 +656,8 @@ class LiveMonitorService : Service() {
             .build()
     }
     override fun onDestroy() {
+        mainHandler.removeCallbacks(ringingWatchdogRunnable)
+        watchdogExecutor.shutdownNow()
         removeSystemOverlayPopupImmediate()
         if (instance === this) instance = null
         super.onDestroy()
